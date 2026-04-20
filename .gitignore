@@ -1,0 +1,16 @@
+# Raw experiment outputs — excluded (large, regenerable)
+results/raw_results.jsonl
+results/judged_results.jsonl
+
+# Python artifacts
+__pycache__/
+*.pyc
+
+# Environment
+.env
+
+# Included results files are tracked explicitly (see git add below):
+#   results/analysis_report.md
+#   results/dashboard.html
+#   results/sample_100.jsonl
+#   results/sample_100_readable.md
