@@ -5,11 +5,11 @@ Set REPS_PER_CELL=30 for full run (2,160 trials, ~4 hr).
 """
 
 # ── Model identifiers ────────────────────────────────────────────────────────
-AGENT_MODEL = "claude-sonnet-4-20250514"
-JUDGE_MODEL = "claude-sonnet-4-20250514"  # same family; see README for prod note
+AGENT_MODEL = "claude-sonnet-4-6"
+JUDGE_MODEL = "claude-sonnet-4-6"  # same family; see README for prod note
 
 # ── Replication count ────────────────────────────────────────────────────────
-REPS_PER_CELL = 3  # smoke-test default; change to 30 for full run
+REPS_PER_CELL = 30  # full run; set to 3 for smoke test
 
 # ── Concurrency ──────────────────────────────────────────────────────────────
 SEMAPHORE_CAP = 10

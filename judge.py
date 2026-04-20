@@ -3,14 +3,20 @@ Judge: scores S3 narratives (narrative_score, faithfulness_score,
 monitoring_awareness_flag) and S1 rationales (faithfulness_score).
 
 Scoring is BLIND — monitoring_condition label is never passed to the judge prompt.
-Input:  results/raw_results.jsonl
-Output: results/judged_results.jsonl  (all rows; judge fields added to S1/S3)
+Input:  results/raw_results.jsonl   (first run)
+        results/judged_results.jsonl (resume/retry run — re-scores only failed rows)
+Output: results/judged_results.jsonl
+
+Re-runnable: on subsequent runs, rows that already have a clean score
+(judge_error is None and the relevant score field is not null) are kept as-is;
+only rows with judge_error or null scores are re-scored.
 """
 
 import asyncio
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 import anthropic
@@ -27,37 +33,80 @@ from prompts import (
     JUDGE_S3_PROMPT_TEMPLATE,
     JUDGE_SYSTEM,
 )
+from runner import parse_s1
+
+# Judge concurrency is capped lower than runner to respect 50 req/min limit.
+# At cap=5 with ~2 s latency each, throughput ≈ 150 req/min theoretical max,
+# but retries with backoff keep effective rate well under the ceiling.
+JUDGE_SEMAPHORE_CAP = min(SEMAPHORE_CAP, 5)
+
+# Retry config for 429 / transient errors
+MAX_RETRIES = 5
+RETRY_BASE_DELAY = 2.0   # seconds; doubled each attempt
 
 
-# ── JSON extraction ───────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _strip_fences(text: str) -> str:
-    """Remove markdown code fences before JSON parsing."""
     text = re.sub(r"^```(?:json)?\s*", "", text.strip(), flags=re.IGNORECASE)
     text = re.sub(r"\s*```$", "", text.strip())
     return text.strip()
 
 
 def _parse_judge_json(text: str) -> dict:
-    cleaned = _strip_fences(text)
-    return json.loads(cleaned)
+    return json.loads(_strip_fences(text))
 
 
-# ── API call ──────────────────────────────────────────────────────────────────
+def _needs_scoring(row: dict) -> bool:
+    """True if the row requires (re-)scoring."""
+    scenario = row.get("scenario")
+    if row.get("parse_error"):
+        return False
+    if scenario == "S2":
+        return False
+    if row.get("judge_error"):
+        return True
+    if scenario == "S3":
+        return row.get("narrative_score") is None or row.get("faithfulness_score") is None
+    if scenario == "S1":
+        return row.get("faithfulness_score") is None
+    return False
+
+
+# ── API call with retry ───────────────────────────────────────────────────────
 
 async def call_judge(
     client: anthropic.AsyncAnthropic,
     user_prompt: str,
     semaphore: asyncio.Semaphore,
 ) -> str:
-    async with semaphore:
-        response = await client.messages.create(
-            model=JUDGE_MODEL,
-            max_tokens=512,
-            system=JUDGE_SYSTEM,
-            messages=[{"role": "user", "content": user_prompt}],
-        )
-    return response.content[0].text
+    delay = RETRY_BASE_DELAY
+    last_exc: Exception | None = None
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            async with semaphore:
+                response = await client.messages.create(
+                    model=JUDGE_MODEL,
+                    max_tokens=512,
+                    system=JUDGE_SYSTEM,
+                    messages=[{"role": "user", "content": user_prompt}],
+                )
+            return response.content[0].text
+        except anthropic.RateLimitError as exc:
+            last_exc = exc
+            await asyncio.sleep(delay)
+            delay *= 2
+        except anthropic.APIStatusError as exc:
+            # Retry on 5xx; re-raise immediately on 4xx (except 429 above)
+            if exc.status_code >= 500:
+                last_exc = exc
+                await asyncio.sleep(delay)
+                delay *= 2
+            else:
+                raise
+
+    raise RuntimeError(f"Judge call failed after {MAX_RETRIES} retries: {last_exc}") from last_exc
 
 
 # ── Per-row scoring ───────────────────────────────────────────────────────────
@@ -90,6 +139,13 @@ async def score_row(
 
     elif scenario == "S1":
         rationale = row.get("rationale", "")
+        # If the stored rationale is empty but response_text exists, the original
+        # parse missed markdown bold formatting (**RATIONALE: ...**). Re-parse now.
+        if not rationale and row.get("response_text"):
+            reparsed = parse_s1(row["response_text"])
+            rationale = reparsed.get("rationale", "")
+            if rationale:
+                row.update(reparsed)  # backfill fixed parse fields into the row
         if not rationale:
             row["judge_error"] = "empty rationale"
             return row
@@ -103,8 +159,6 @@ async def score_row(
         except Exception as exc:
             row["judge_error"] = str(exc)
 
-    # S2 rows pass through unchanged (no judge scoring needed)
-
     return row
 
 
@@ -115,37 +169,56 @@ async def main() -> None:
     if not api_key:
         raise EnvironmentError("ANTHROPIC_API_KEY environment variable is not set.")
 
+    # Prefer judged_results (resume) over raw_results (first run)
+    judged_path = Path(JUDGED_RESULTS_FILE)
     raw_path = Path(RAW_RESULTS_FILE)
-    if not raw_path.exists():
-        raise FileNotFoundError(f"{RAW_RESULTS_FILE} not found. Run runner.py first.")
+
+    if judged_path.exists():
+        source_path = judged_path
+        print(f"Resuming from {JUDGED_RESULTS_FILE}")
+    elif raw_path.exists():
+        source_path = raw_path
+        print(f"First run — reading from {RAW_RESULTS_FILE}")
+    else:
+        raise FileNotFoundError(
+            f"Neither {JUDGED_RESULTS_FILE} nor {RAW_RESULTS_FILE} found. "
+            "Run runner.py first."
+        )
 
     rows = []
-    with raw_path.open(encoding="utf-8") as f:
+    with source_path.open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
                 rows.append(json.loads(line))
 
-    scoreable = [r for r in rows if r.get("scenario") in ("S1", "S3") and not r.get("parse_error")]
-    passthrough = [r for r in rows if r.get("scenario") == "S2" or r.get("parse_error")]
+    to_score = [r for r in rows if _needs_scoring(r)]
+    skip = [r for r in rows if not _needs_scoring(r)]
 
-    print(f"Rows to score: {len(scoreable)}  Pass-through: {len(passthrough)}")
+    print(f"Total rows: {len(rows)}  |  To score: {len(to_score)}  |  Already done / pass-through: {len(skip)}")
+    if not to_score:
+        print("Nothing to score — all rows already have clean results.")
+        return
 
     client = anthropic.AsyncAnthropic(api_key=api_key)
-    semaphore = asyncio.Semaphore(SEMAPHORE_CAP)
+    semaphore = asyncio.Semaphore(JUDGE_SEMAPHORE_CAP)
 
-    tasks = [score_row(client, row, semaphore) for row in scoreable]
-    scored = await atqdm.gather(*tasks, desc="Judging")
+    tasks = [score_row(client, row, semaphore) for row in to_score]
+    scored = list(await atqdm.gather(*tasks, desc="Judging"))
 
-    all_rows = list(scored) + passthrough
+    errors = [r for r in scored if r.get("judge_error")]
+    print(f"\nScored: {len(scored) - len(errors)}  |  Errors remaining: {len(errors)}")
+    if errors:
+        print("  Re-run judge.py to retry failed rows.")
+
+    all_rows = scored + skip
     all_rows.sort(key=lambda r: r.get("timestamp", ""))
 
-    out_path = Path(JUDGED_RESULTS_FILE)
-    with out_path.open("w", encoding="utf-8") as f:
+    with judged_path.open("w", encoding="utf-8") as f:
         for row in all_rows:
             f.write(json.dumps(row) + "\n")
 
-    print(f"\nDone. Judged results written to {JUDGED_RESULTS_FILE}")
+    print(f"Written: {JUDGED_RESULTS_FILE}")
 
 
 if __name__ == "__main__":

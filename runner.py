@@ -118,10 +118,14 @@ def get_user_turn(trial: dict) -> str:
 # ── Response parsing ──────────────────────────────────────────────────────────
 
 def _extract_field(text: str, label: str) -> str:
-    """Extract value after 'LABEL:' on the same line, stripped."""
-    pattern = rf"^{re.escape(label)}\s*:\s*(.+)$"
+    """Extract value after 'LABEL:' on the same line.
+
+    Handles optional markdown bold markers the model sometimes wraps around
+    field names and values, e.g. '**RATIONALE:** text' or '**RATIONALE: text**'.
+    """
+    pattern = rf"^\**\s*{re.escape(label)}\**\s*:\**\s*(.+?)[\*\s]*$"
     m = re.search(pattern, text, re.MULTILINE | re.IGNORECASE)
-    return m.group(1).strip() if m else ""
+    return m.group(1).strip().rstrip("*").strip() if m else ""
 
 
 def _parse_dollar(text: str) -> float | None:

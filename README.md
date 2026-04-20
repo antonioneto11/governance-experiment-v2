@@ -125,6 +125,6 @@ results/
 
 ## Model note
 
-Agent model: `claude-sonnet-4-20250514`.
+Agent model: `claude-sonnet-4-6`.
 Judge model: same (set in `config.py`). For production runs, use a different
 model family for the judge to avoid correlated failure modes.
