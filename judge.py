@@ -92,6 +92,7 @@ async def call_judge(
                     system=JUDGE_SYSTEM,
                     messages=[{"role": "user", "content": user_prompt}],
                 )
+                await asyncio.sleep(1)  # 1 s per slot to stay under 50 req/min
             return response.content[0].text
         except anthropic.RateLimitError as exc:
             last_exc = exc
@@ -169,33 +170,51 @@ async def main() -> None:
     if not api_key:
         raise EnvironmentError("ANTHROPIC_API_KEY environment variable is not set.")
 
-    # Prefer judged_results (resume) over raw_results (first run)
-    judged_path = Path(JUDGED_RESULTS_FILE)
     raw_path = Path(RAW_RESULTS_FILE)
+    judged_path = Path(JUDGED_RESULTS_FILE)
 
-    if judged_path.exists():
-        source_path = judged_path
-        print(f"Resuming from {JUDGED_RESULTS_FILE}")
-    elif raw_path.exists():
-        source_path = raw_path
-        print(f"First run — reading from {RAW_RESULTS_FILE}")
-    else:
-        raise FileNotFoundError(
-            f"Neither {JUDGED_RESULTS_FILE} nor {RAW_RESULTS_FILE} found. "
-            "Run runner.py first."
-        )
+    if not raw_path.exists():
+        raise FileNotFoundError(f"{RAW_RESULTS_FILE} not found. Run runner.py first.")
 
-    rows = []
-    with source_path.open(encoding="utf-8") as f:
+    # raw_results is always the authoritative source of all trial rows.
+    raw_rows: list[dict] = []
+    with raw_path.open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
-                rows.append(json.loads(line))
+                raw_rows.append(json.loads(line))
 
-    to_score = [r for r in rows if _needs_scoring(r)]
-    skip = [r for r in rows if not _needs_scoring(r)]
+    # judged_results is a cache: load already-clean scores keyed by trial_id.
+    already_scored: dict[str, dict] = {}
+    if judged_path.exists():
+        with judged_path.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                r = json.loads(line)
+                if not _needs_scoring(r):
+                    already_scored[r["trial_id"]] = r
 
-    print(f"Total rows: {len(rows)}  |  To score: {len(to_score)}  |  Already done / pass-through: {len(skip)}")
+    # Merge: prefer cached score → pass-through (no scoring needed) → queue.
+    to_score: list[dict] = []
+    skip: list[dict] = []
+    for row in raw_rows:
+        cached = already_scored.get(row["trial_id"])
+        if cached is not None:
+            # Already has a clean score from a previous run.
+            skip.append(cached)
+        elif not _needs_scoring(row):
+            # parse_error=True or S2 — pass through as-is from raw_results.
+            skip.append(row)
+        else:
+            to_score.append(row)
+
+    print(
+        f"raw_results rows: {len(raw_rows)}  |  "
+        f"Already scored (cached): {len(skip)}  |  "
+        f"To score: {len(to_score)}"
+    )
     if not to_score:
         print("Nothing to score — all rows already have clean results.")
         return
@@ -218,7 +237,7 @@ async def main() -> None:
         for row in all_rows:
             f.write(json.dumps(row) + "\n")
 
-    print(f"Written: {JUDGED_RESULTS_FILE}")
+    print(f"Written: {JUDGED_RESULTS_FILE}  ({len(all_rows)} rows)")
 
 
 if __name__ == "__main__":
