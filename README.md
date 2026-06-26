@@ -15,6 +15,9 @@ Operationalizes three formal constructs from the paper:
 ```bash
 pip install anthropic pandas scipy scikit-posthocs tqdm
 export ANTHROPIC_API_KEY=your_key
+
+# Optional: Langfuse tracing (only if you want observability — see below)
+pip install langfuse opentelemetry-instrumentation-anthropic
 ```
 
 ## Run order
@@ -122,6 +125,36 @@ results/
 ```
 
 ---
+
+## Observability (Langfuse)
+
+The runner and judge are instrumented with [Langfuse](https://langfuse.com). Tracing is
+**opt-in and silent when off**: set the env vars below to enable it; leave them unset and the
+experiment runs exactly as before (no extra dependency needed, including for `analysis.py`).
+
+```bash
+export LANGFUSE_PUBLIC_KEY=pk-lf-...
+export LANGFUSE_SECRET_KEY=sk-lf-...
+export LANGFUSE_BASE_URL=https://cloud.langfuse.com   # or us./your self-hosted URL
+```
+
+What gets traced (see `observability.py`):
+
+- **`trial-S1/S2/S3`** — one trace per `run_trial`, with the agent's `messages.create`
+  auto-captured as a `generation` (model, tokens, cost, latency). Trace input is the
+  experimental cell + user turn; output is the scored signal (`compliance_score`,
+  `exploitation_score`, …).
+- **`judge-S1/S3`** — one trace per `score_row`, with the judge call auto-captured as a
+  generation and the parsed scores as output. Scoring stays **blind**: the monitoring label is
+  used only as a filter tag, never added to the judge prompt.
+- **Sessions / tags** — all reps of one experimental cell share a session id
+  (`scenario-monitoring-pattern-framing`), and the agent trial and its judge trace share that
+  session, so a cell reads as one unit. Traces are tagged by scenario, monitoring condition,
+  framing, governance pattern, and model.
+- **Masking** — card/SSN/phone-like strings are redacted from exported spans.
+
+The `runner.py` and `judge.py` `main()` flush spans before exit; the `*_s1v2.py` and
+`rerun_*.py` scripts reuse the instrumented functions and rely on the SDK's at-exit flush.
 
 ## Model note
 

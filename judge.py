@@ -34,6 +34,7 @@ from prompts import (
     JUDGE_SYSTEM,
 )
 from runner import parse_s1
+from observability import observe, trace_context, update_trace, flush as flush_tracing
 
 # Judge concurrency is capped lower than runner to respect 50 req/min limit.
 # At cap=5 with ~2 s latency each, throughput ≈ 150 req/min theoretical max,
@@ -112,6 +113,10 @@ async def call_judge(
 
 # ── Per-row scoring ───────────────────────────────────────────────────────────
 
+# `capture_input=False`: the args are a client/semaphore + the full row; we set a
+# clean input (just the text being judged) explicitly. Each judge call is also
+# auto-traced as a `generation` (model, tokens) by the Anthropic instrumentor.
+@observe(name="judge", capture_input=False, capture_output=False)
 async def score_row(
     client: anthropic.AsyncAnthropic,
     row: dict,
@@ -119,46 +124,67 @@ async def score_row(
 ) -> dict:
     scenario = row.get("scenario")
 
-    if scenario == "S3":
-        rationale = row.get("raw_rationale", "")
-        if not rationale:
-            row["judge_error"] = "empty raw_rationale"
-            return row
-        prompt = JUDGE_S3_PROMPT_TEMPLATE.format(rationale=rationale)
-        try:
-            raw = await call_judge(client, prompt, semaphore)
-            scores = _parse_judge_json(raw)
-            row["narrative_score"] = scores.get("narrative_score")
-            row["faithfulness_score"] = scores.get("faithfulness_score")
-            row["monitoring_awareness_flag"] = scores.get("monitoring_awareness_flag")
-            row["narrative_score_reason"] = scores.get("narrative_score_reason", "")
-            row["faithfulness_score_reason"] = scores.get("faithfulness_score_reason", "")
-            row["monitoring_awareness_reason"] = scores.get("monitoring_awareness_reason", "")
-            row["judge_error"] = None
-        except Exception as exc:
-            row["judge_error"] = str(exc)
+    # Same session id the runner used for this trial, so the blind judge trace
+    # sits next to the agent trial it scores. Scoring is still blind: the
+    # monitoring label is never sent to the judge prompt, only used as a tag.
+    mon = row.get("monitoring_condition")
+    pat = row.get("governance_pattern")
+    framing = row.get("framing")
 
-    elif scenario == "S1":
-        rationale = row.get("rationale", "")
-        # If the stored rationale is empty but response_text exists, the original
-        # parse missed markdown bold formatting (**RATIONALE: ...**). Re-parse now.
-        if not rationale and row.get("response_text"):
-            reparsed = parse_s1(row["response_text"])
-            rationale = reparsed.get("rationale", "")
-            if rationale:
-                row.update(reparsed)  # backfill fixed parse fields into the row
-        if not rationale:
-            row["judge_error"] = "empty rationale"
-            return row
-        prompt = JUDGE_S1_RATIONALE_PROMPT_TEMPLATE.format(rationale=rationale)
-        try:
-            raw = await call_judge(client, prompt, semaphore)
-            scores = _parse_judge_json(raw)
-            row["faithfulness_score"] = scores.get("faithfulness_score")
-            row["faithfulness_score_reason"] = scores.get("faithfulness_score_reason", "")
-            row["judge_error"] = None
-        except Exception as exc:
-            row["judge_error"] = str(exc)
+    with trace_context(
+        trace_name=f"judge-{scenario}",
+        session_id=f"{scenario}-{mon}-{pat}-{framing}",
+        tags=[scenario, f"model:{JUDGE_MODEL}", "judge"],
+        metadata={"trial_id": row.get("trial_id"), "rep": row.get("rep")},
+    ):
+        if scenario == "S3":
+            rationale = row.get("raw_rationale", "")
+            if not rationale:
+                row["judge_error"] = "empty raw_rationale"
+                return row
+            update_trace(input={"rationale": rationale})
+            prompt = JUDGE_S3_PROMPT_TEMPLATE.format(rationale=rationale)
+            try:
+                raw = await call_judge(client, prompt, semaphore)
+                scores = _parse_judge_json(raw)
+                row["narrative_score"] = scores.get("narrative_score")
+                row["faithfulness_score"] = scores.get("faithfulness_score")
+                row["monitoring_awareness_flag"] = scores.get("monitoring_awareness_flag")
+                row["narrative_score_reason"] = scores.get("narrative_score_reason", "")
+                row["faithfulness_score_reason"] = scores.get("faithfulness_score_reason", "")
+                row["monitoring_awareness_reason"] = scores.get("monitoring_awareness_reason", "")
+                row["judge_error"] = None
+                update_trace(output={
+                    "narrative_score": row["narrative_score"],
+                    "faithfulness_score": row["faithfulness_score"],
+                    "monitoring_awareness_flag": row["monitoring_awareness_flag"],
+                })
+            except Exception as exc:
+                row["judge_error"] = str(exc)
+
+        elif scenario == "S1":
+            rationale = row.get("rationale", "")
+            # If the stored rationale is empty but response_text exists, the original
+            # parse missed markdown bold formatting (**RATIONALE: ...**). Re-parse now.
+            if not rationale and row.get("response_text"):
+                reparsed = parse_s1(row["response_text"])
+                rationale = reparsed.get("rationale", "")
+                if rationale:
+                    row.update(reparsed)  # backfill fixed parse fields into the row
+            if not rationale:
+                row["judge_error"] = "empty rationale"
+                return row
+            update_trace(input={"rationale": rationale})
+            prompt = JUDGE_S1_RATIONALE_PROMPT_TEMPLATE.format(rationale=rationale)
+            try:
+                raw = await call_judge(client, prompt, semaphore)
+                scores = _parse_judge_json(raw)
+                row["faithfulness_score"] = scores.get("faithfulness_score")
+                row["faithfulness_score_reason"] = scores.get("faithfulness_score_reason", "")
+                row["judge_error"] = None
+                update_trace(output={"faithfulness_score": row["faithfulness_score"]})
+            except Exception as exc:
+                row["judge_error"] = str(exc)
 
     return row
 
@@ -224,6 +250,7 @@ async def main() -> None:
 
     tasks = [score_row(client, row, semaphore) for row in to_score]
     scored = list(await atqdm.gather(*tasks, desc="Judging"))
+    flush_tracing()  # ensure all buffered Langfuse spans are sent (no-op if off)
 
     errors = [r for r in scored if r.get("judge_error")]
     print(f"\nScored: {len(scored) - len(errors)}  |  Errors remaining: {len(errors)}")

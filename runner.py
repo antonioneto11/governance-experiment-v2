@@ -40,6 +40,7 @@ from prompts import (
     SYSTEM_BASE,
     SYSTEM_S3,
 )
+from observability import observe, trace_context, update_trace, flush as flush_tracing
 
 
 # ── Trial generation ──────────────────────────────────────────────────────────
@@ -242,6 +243,10 @@ async def call_agent(
 
 # ── Single trial ──────────────────────────────────────────────────────────────
 
+# `capture_input=False` because the function args are clients/locks/paths — we
+# set a clean, cell-level input explicitly instead (see "Common Mistakes" in the
+# Langfuse instrumentation guide).
+@observe(name="trial", capture_input=False, capture_output=False)
 async def run_trial(
     client: anthropic.AsyncAnthropic,
     trial: dict,
@@ -254,34 +259,66 @@ async def run_trial(
     system_prompt = assemble_system_prompt(trial)
     user_turn = get_user_turn(trial)
 
+    scenario = trial["scenario"]
+    mon = trial["monitoring_condition"]
+    pat = trial.get("governance_pattern")
+    framing = trial["framing"]
+
+    # One trace per trial. Reps of the same experimental cell share a session id
+    # so they cluster in Langfuse; the cell dimensions become filterable tags.
+    cell_tags = [scenario, f"monitoring:{mon}", f"framing:{framing}", f"model:{AGENT_MODEL}"]
+    if pat:
+        cell_tags.append(f"pattern:{pat}")
+
     parse_error = False
     parsed = {}
 
-    try:
-        response_text = await call_agent(client, system_prompt, user_turn, semaphore)
-        scenario = trial["scenario"]
-        if scenario == "S1":
-            parsed = parse_s1(response_text)
-        elif scenario == "S2":
-            parsed = parse_s2(response_text)
-        else:
-            parsed = parse_s3(response_text)
-        parsed["response_text"] = response_text
-    except Exception as exc:
-        parse_error = True
-        parsed = {"error": str(exc)}
+    with trace_context(
+        trace_name=f"trial-{scenario}",
+        session_id=f"{scenario}-{mon}-{pat}-{framing}",
+        tags=cell_tags,
+        metadata={"trial_id": trial_id, "rep": trial["rep"]},
+    ):
+        update_trace(input={
+            "scenario": scenario,
+            "monitoring_condition": mon,
+            "governance_pattern": pat,
+            "framing": framing,
+            "user_turn": user_turn,
+        })
 
-    row = {
-        "trial_id": trial_id,
-        "scenario": trial["scenario"],
-        "monitoring_condition": trial["monitoring_condition"],
-        "governance_pattern": trial.get("governance_pattern"),
-        "framing": trial["framing"],
-        "rep": trial["rep"],
-        "timestamp": timestamp,
-        "parse_error": parse_error,
-        **parsed,
-    }
+        try:
+            response_text = await call_agent(client, system_prompt, user_turn, semaphore)
+            if scenario == "S1":
+                parsed = parse_s1(response_text)
+            elif scenario == "S2":
+                parsed = parse_s2(response_text)
+            else:
+                parsed = parse_s3(response_text)
+            parsed["response_text"] = response_text
+        except Exception as exc:
+            parse_error = True
+            parsed = {"error": str(exc)}
+
+        row = {
+            "trial_id": trial_id,
+            "scenario": trial["scenario"],
+            "monitoring_condition": trial["monitoring_condition"],
+            "governance_pattern": trial.get("governance_pattern"),
+            "framing": trial["framing"],
+            "rep": trial["rep"],
+            "timestamp": timestamp,
+            "parse_error": parse_error,
+            **parsed,
+        }
+
+        # Concise trace output: the scored signal for this scenario, not the full row.
+        update_trace(output={
+            k: row[k] for k in (
+                "parse_error", "compliance_score", "exploitation_score",
+                "decision", "methodology", "limit_breach",
+            ) if k in row
+        })
 
     async with write_lock:
         with out_path.open("a", encoding="utf-8") as f:
@@ -311,6 +348,7 @@ async def main() -> None:
     ]
 
     await atqdm.gather(*tasks, desc="Running trials")
+    flush_tracing()  # ensure all buffered Langfuse spans are sent (no-op if off)
     print(f"\nDone. Results written to {RAW_RESULTS_FILE}")
 
 
